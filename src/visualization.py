@@ -8,7 +8,7 @@ def visualize_graph():
 
     # Convert node coordinates to numeric types (NetworkX may read them as strings)
     for node in G.nodes:
-        G.nodes[node]['x'] = float(G.nodes[node]['x'])
+        G.nodes[node]['x'] = float(G.nodes[node]['x']) #ta aqui um problema
         G.nodes[node]['y'] = float(G.nodes[node]['y'])
 
     # Create a Folium map centered on Lisbon

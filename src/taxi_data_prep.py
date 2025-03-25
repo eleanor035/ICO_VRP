@@ -2,7 +2,6 @@ import pandas as pd
 import geopandas as gpd
 from shapely.geometry import Point
 
-
 #xlsx to csv
 df = pd.read_excel('data\\raw\\Praças de Táxis Lisboa.xlsx', engine='openpyxl')
 df.to_csv('data\\processed\\pracas_taxis_lisboa.csv', index=False, encoding='utf-8')

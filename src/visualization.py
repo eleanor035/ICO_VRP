@@ -1,48 +1,44 @@
-import networkx as nx
+import os
 import folium
-from shapely.geometry import Point
+import networkx as nx
+from pyproj import Transformer
 
 def visualize_graph():
-    # Load the graph
+    """Visualize the preprocessed graph"""
+    # Create output directory
+    if not os.path.exists("web"):
+        os.makedirs("web")
+    
+    # Load graph
     G = nx.read_graphml("data/processed/road_network.graphml")
-
-    # Convert node coordinates to numeric types (NetworkX may read them as strings)
-    for node in G.nodes:
-        G.nodes[node]['x'] = float(G.nodes[node]['x']) #ta aqui um problema
-        G.nodes[node]['y'] = float(G.nodes[node]['y'])
-
-    # Create a Folium map centered on Lisbon
-    lisbon_center = [38.7223, -9.1393]
-    m = folium.Map(location=lisbon_center, zoom_start=13, tiles="OpenStreetMap")
-
-    # Add road edges to the map
+    
+    # Coordinate transformer
+    transformer = Transformer.from_crs("EPSG:3763", "EPSG:4326", always_xy=True)
+    
+    # Create map
+    m = folium.Map(location=[38.7223, -9.1393], zoom_start=13, tiles="OpenStreetMap")
+    
+    # Add roads
     for edge in G.edges:
         start = G.nodes[edge[0]]
         end = G.nodes[edge[1]]
+        lon_start, lat_start = transformer.transform(start['x'], start['y'])
+        lon_end, lat_end = transformer.transform(end['x'], end['y'])
         folium.PolyLine(
-            locations=[
-                [start['y'], start['x']],  # Folium uses [lat, lon]
-                [end['y'], end['x']]
-            ],
-            color='gray',
-            weight=1,
-            opacity=0.7
+            locations=[[lat_start, lon_start], [lat_end, lon_end]],
+            color='grey', weight=1.5
         ).add_to(m)
-
-    # Add taxi rank nodes (marked with is_taxi_rank=True)
-    taxi_nodes = [node for node in G.nodes if G.nodes[node].get('is_taxi_rank', False)]
+    
+    # Add taxi ranks
+    taxi_nodes = [n for n in G.nodes if G.nodes[n].get('is_taxi_rank', False)]
     for node in taxi_nodes:
+        lon, lat = transformer.transform(G.nodes[node]['x'], G.nodes[node]['y'])
         folium.CircleMarker(
-            location=[G.nodes[node]['y'], G.nodes[node]['x']],
-            radius=5,
-            color='red',
-            fill=True,
-            fill_color='red',
-            popup=f"Taxi Rank: {node}"
+            location=[lat, lon], radius=5, color='red', popup=f"Taxi Rank: {node}"
         ).add_to(m)
-
-    # Save the map
-    m.save("../web/vrp_graph_map.html")
+    
+    # Save map
+    m.save("web/vrp_graph_map.html")
     print("Map saved to web/vrp_graph_map.html")
 
 if __name__ == "__main__":

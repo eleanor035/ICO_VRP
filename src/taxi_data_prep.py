@@ -8,9 +8,7 @@ df.to_csv('data\\processed\\pracas_taxis_lisboa.csv', index=False, encoding='utf
 print(df.head())
 df['Longitude'] = df['Longitude'].astype(float)
 
-
 #csv to geojson
 geometry = [Point(lon, lat) for lon, lat in zip(df.Longitude, df.Latitude)]
 gdf = gpd.GeoDataFrame(df, geometry=geometry, crs="EPSG:4326")
 gdf.to_file("data\\processed\\lisbon_taxi_ranks.geojson", driver="GeoJSON")
-

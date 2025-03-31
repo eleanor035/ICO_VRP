@@ -38,8 +38,8 @@ def visualize_graph():
         ).add_to(m)
     
     # Save map
-    m.save("web/vrp_graph_map.html")
-    print("Map saved to web/vrp_graph_map.html")
+    m.save("web/vrp_interface.html")
+    print("Map saved to web/vrp_interface.html")
 
 if __name__ == "__main__":
     visualize_graph()

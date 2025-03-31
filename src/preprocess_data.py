@@ -1,129 +1,224 @@
-# Data cleaning and graph construction
+# src/preprocess_data.py
+import logging
 import geopandas as gpd
 import networkx as nx
 from shapely.ops import split, nearest_points
 from pyproj import Transformer
-from shapely.geometry import Point
+from shapely.geometry import Point, LineString
+from pathlib import Path
 
-def split_line_at_point(line, point):
-    """Split a LineString at a point with validation"""
-    if line.distance(point) > 0.1:  # 10cm tolerance
-        return [line]
-    split_result = split(line, line.interpolate(line.project(point)))
-    return list(split_result.geoms) if split_result.geom_type == 'GeometryCollection' else [split_result]
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Load data
-gdf = gpd.read_file("data/processed/map.geojson")
-roads = gdf[gdf.geometry.type == 'LineString'].copy()
-taxi_ranks = gdf[gdf.geometry.type == 'Point'].copy()
+class RoadNetworkProcessor:
+    """Process raw geospatial data into routable network graph"""
+    
+    def __init__(self, raw_data_dir="data/raw", processed_data_dir="data/processed"):
+        self.raw_data_dir = Path(raw_data_dir)
+        self.processed_data_dir = Path(processed_data_dir)
+        self.transformer = Transformer.from_crs("EPSG:4326", "EPSG:3763")
+        self.G = nx.Graph()
+        self.roads = None
+        self.taxi_ranks = None
 
-# Reproject to UTM Zone 29N (EPSG:3763)
-roads = roads.to_crs(epsg=3763)
-taxi_ranks = taxi_ranks.to_crs(epsg=3763)
+    def load_data(self):
+        """Load and validate raw data"""
+        try:
+            # Load data from correct raw directory
+            roads_path = self.processed_data_dir / "estradas_lisboa.geojson"
+            taxi_ranks_path = self.processed_data_dir / "lisbon_taxi_ranks.geojson"
+            
+            self.roads = gpd.read_file(roads_path)
+            self.taxi_ranks = gpd.read_file(taxi_ranks_path)
+            
+            # Validate and clean geometries
+            self.roads = self.roads[self.roads.geometry.type == 'LineString']
+            self.taxi_ranks = self.taxi_ranks[self.taxi_ranks.geometry.type == 'Point']
+            self.roads = self.roads[~self.roads.is_empty]
+            self.taxi_ranks = self.taxi_ranks[~self.taxi_ranks.is_empty]
+            
+            if self.roads.empty or self.taxi_ranks.empty:
+                raise ValueError("Empty dataset loaded after filtering")
+                
+            logger.info(f"Loaded {len(self.roads)} roads and {len(self.taxi_ranks)} taxi ranks")
+            
+        except Exception as e:
+            logger.error(f"Data loading failed: {str(e)}")
+            raise
 
-G = nx.Graph()
+    def _reproject_data(self):
+        """Convert data to UTM coordinates"""
+        self.roads = self.roads.to_crs(epsg=3763)
+        self.taxi_ranks = self.taxi_ranks.to_crs(epsg=3763)
+        logger.debug("Reprojected data to UTM Zone 29N (EPSG:3763)")
 
-# Add roads with string IDs and attributes
-for _, road in roads.iterrows():
-    coords = list(road.geometry.coords)
-    for i in range(len(coords) - 1):
-        start = coords[i]
-        end = coords[i+1]
-        start_id = f"{start[0]}_{start[1]}"
-        end_id = f"{end[0]}_{end[1]}"
+    def _create_base_graph(self):
+        """Build initial road network graph"""
+        for idx, road in self.roads.iterrows():
+            line = road.geometry
+            if line.is_empty or not isinstance(line, LineString):
+                continue
+                
+            coords = list(line.coords)
+            for i in range(len(coords) - 1):
+                self._add_edge(
+                    start=coords[i],
+                    end=coords[i+1],
+                    length=line.length,
+                    road_properties=road.drop('geometry').to_dict()
+                )
+
+        logger.info(f"Base graph created with {len(self.G.nodes)} nodes and {len(self.G.edges)} edges")
+
+    def _add_edge(self, start, end, length, road_properties):
+        """Add edge with attributes to graph"""
+        start_id = self._node_id(start)
+        end_id = self._node_id(end)
         
-        G.add_node(start_id, x=start[0], y=start[1], is_taxi_rank=False)
-        G.add_node(end_id, x=end[0], y=end[1], is_taxi_rank=False)
-        G.add_edge(start_id, end_id, weight=road.geometry.length)
-
-# Process taxi ranks
-for _, taxi in taxi_ranks.iterrows():
-    point = taxi.geometry
-    closest_road = roads.distance(point).idxmin()
-    road_geom = roads.loc[closest_road].geometry
+        # Convert LineString to WKT format
+        edge_geometry = LineString([start, end]).wkt  # << Convert to WKT
+        
+        # Add nodes with default attributes if missing
+        if start_id not in self.G.nodes:
+            self.G.add_node(start_id, x=start[0], y=start[1], is_taxi_rank=False)
+        if end_id not in self.G.nodes:
+            self.G.add_node(end_id, x=end[0], y=end[1], is_taxi_rank=False)
+        
+        # Add edge with metadata
+        self.G.add_edge(
+            start_id, end_id,
+            weight=length,
+            geometry=edge_geometry,  # Now stores WKT string
+            **road_properties
+        )
     
-    # Split road
-    split_result = split_line_at_point(road_geom, point)
+    def _node_id(self, coords):
+        """Generate precise node ID from coordinates (8 decimal places)"""
+        return f"{coords[0]:.8f}_{coords[1]:.8f}"
+
+    def _process_taxi_ranks(self):
+        """Integrate taxi ranks into road network"""
+        spatial_index = self.roads.sindex
+        
+        for idx, taxi in self.taxi_ranks.iterrows():
+            # Get validated geometry object
+            point = taxi.geometry
+            
+            # Validate geometry type and validity
+            if not isinstance(point, Point) or not point.is_valid or point.is_empty:
+                logger.warning(f"Skipping invalid taxi rank at index {idx}")
+                continue
+                
+            # Find nearest road using spatial index (FIXED HERE)
+            try:
+                # Use the full Point geometry instead of bounds
+                possible_matches = list(spatial_index.nearest(point))
+                nearest_road_idx = possible_matches[0]
+                road = self.roads.iloc[nearest_road_idx]
+            except IndexError:
+                logger.warning(f"No road found near taxi rank at {point}")
+                continue
+
+            # Split road and connect taxi node
+            split_node_id = self._split_road_at_point(road, point)
+            if split_node_id:
+                self._add_taxi_node(split_node_id, taxi)
+
+        logger.info(f"Processed {len(self.taxi_ranks)} taxi ranks")
+
+    def _split_road_at_point(self, road, point):
+        """Split road at point and return connection node ID"""
+        # Extract scalar LineString from GeoSeries
+        original_line = road.geometry.iloc[0]
+        
+        # Verify proximity to road
+        distance = original_line.distance(point)
+        if distance > 1.0:  # 1 meter tolerance
+            logger.warning(f"Taxi rank too far from road ({distance:.2f}m)")
+            return None
+
+        # Find exact split point
+        split_point = nearest_points(original_line, point)[0]
+        split_node_id = self._node_id((split_point.x, split_point.y))
+        
+        try:
+            # Split road geometry
+            split_result = split(original_line, split_point)
+            segments = [seg for seg in split_result.geoms if isinstance(seg, LineString)]
+            
+            if len(segments) != 2:
+                logger.warning(f"Unexpected split result: {len(segments)} segments")
+                return None
+
+            # Remove original edges
+            original_coords = list(original_line.coords)
+            for i in range(len(original_coords) - 1):
+                start_id = self._node_id(original_coords[i])
+                end_id = self._node_id(original_coords[i+1])
+                if self.G.has_edge(start_id, end_id):
+                    self.G.remove_edge(start_id, end_id)
+
+            # Add new split segments with connection to split point
+            for seg in segments:
+                seg_coords = list(seg.coords)
+                for i in range(len(seg_coords) - 1):
+                    self._add_edge(
+                        seg_coords[i], seg_coords[i+1],
+                        seg.length, road.drop('geometry').to_dict()
+                    )
+                
+                # Connect to split point
+                last_node = self._node_id(seg_coords[-1])
+                self.G.add_edge(last_node, split_node_id, weight=0)
+            
+            return split_node_id
+
+        except Exception as e:
+            logger.error(f"Failed to split road: {str(e)}")
+            return None
+
+    def _add_taxi_node(self, node_id, taxi_data):
+        """Mark existing node as taxi rank"""
+        if node_id not in self.G.nodes:
+            logger.warning(f"Taxi node {node_id} not found in graph")
+            return
+            
+        # Update node attributes
+        self.G.nodes[node_id].update({
+            'is_taxi_rank': True,
+            **taxi_data.drop('geometry').to_dict()
+        })
+        logger.debug(f"Added taxi rank at {node_id}")
+
+    def save_results(self):
+        """Save processed data to disk"""
+        self.processed_data_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Save graph with XML writer
+        nx.write_graphml(self.G, self.processed_data_dir / "road_network.graphml")  # Correct extension
+        
+        # Save reprojected roads
+        self.roads.to_file(
+            self.processed_data_dir / "roads_utm.geojson",
+            driver="GeoJSON"
+        )
+        
+        logger.info(f"Saved processed data to {self.processed_data_dir}")
+
+    def process(self):
+        """Main processing pipeline"""
+        self.load_data()
+        self._reproject_data()
+        self._create_base_graph()
+        self._process_taxi_ranks()
+        self.save_results()
+        return self.G
+
+if __name__ == "__main__":
+    processor = RoadNetworkProcessor()
+    final_graph = processor.process()
     
-    # Remove original edges
-    original_coords = list(road_geom.coords)
-    for i in range(len(original_coords) - 1):
-        start = f"{original_coords[i][0]}_{original_coords[i][1]}"
-        end = f"{original_coords[i+1][0]}_{original_coords[i+1][1]}"
-        if G.has_edge(start, end):
-            G.remove_edge(start, end)
-    
-    # Add new split segments
-    for new_line in split_result:
-        new_coords = list(new_line.coords)
-        for i in range(len(new_coords) - 1):
-            start = f"{new_coords[i][0]}_{new_coords[i][1]}"
-            end = f"{new_coords[i+1][0]}_{new_coords[i+1][1]}"
-            G.add_node(start, x=new_coords[i][0], y=new_coords[i][1], is_taxi_rank=False)
-            G.add_node(end, x=new_coords[i+1][0], y=new_coords[i+1][1], is_taxi_rank=False)
-            G.add_edge(start, end, weight=new_line.length)
-    
-    # Add taxi rank node with coordinates
-    snapped_point = nearest_points(road_geom, point)[0]
-    node_id = f"{snapped_point.x}_{snapped_point.y}"
-    G.add_node(node_id, x=snapped_point.x, y=snapped_point.y, is_taxi_rank=True)
-    
-def add_temporary_depot(G, depot_lat, depot_lon, roads):
-    """Add a temporary depot node to the graph and return the modified graph."""
-    # Convert depot location to UTM (EPSG:3763)
-    transformer_wgs84_to_utm = Transformer.from_crs("EPSG:4326", "EPSG:3763", always_xy=True)
-    depot_x, depot_y = transformer_wgs84_to_utm.transform(depot_lon, depot_lat)
-    depot_point = Point(depot_x, depot_y)
-
-    # Find the nearest road segment
-    roads_gdf = gpd.GeoDataFrame(geometry=roads.geometry, crs=roads.crs)
-    nearest_road_idx = roads_gdf.distance(depot_point).idxmin()
-    road_geom = roads_gdf.geometry.iloc[nearest_road_idx]
-
-    # Snap depot to the nearest point on the road
-    snapped_point = nearest_points(road_geom, depot_point)[0]
-
-    # Split the road at the snapped point
-    split_result = split(road_geom, snapped_point)
-    if split_result.geom_type == 'GeometryCollection':
-        segments = list(split_result.geoms)
-    else:
-        segments = [split_result]
-
-    # Create a temporary graph copy
-    G_temp = G.copy()
-
-    # Add depot node
-    depot_node_id = f"depot_{snapped_point.x}_{snapped_point.y}"
-    G_temp.add_node(depot_node_id, x=snapped_point.x, y=snapped_point.y, is_depot=True)
-
-    # Remove original edges of the split road
-    original_coords = list(road_geom.coords)
-    for i in range(len(original_coords) - 1):
-        start = f"{original_coords[i][0]}_{original_coords[i][1]}"
-        end = f"{original_coords[i+1][0]}_{original_coords[i+1][1]}"
-        if G_temp.has_edge(start, end):
-            G_temp.remove_edge(start, end)
-
-    # Add new edges from the split segments
-    for seg in segments:
-        seg_coords = list(seg.coords)
-        for i in range(len(seg_coords) - 1):
-            start = f"{seg_coords[i][0]}_{seg_coords[i][1]}"
-            end = f"{seg_coords[i+1][0]}_{seg_coords[i+1][1]}"
-            G_temp.add_edge(start, end, weight=seg.length)
-
-    # Connect depot to the split points (assumes segments are non-empty)
-    if len(segments) > 0:
-        seg1_end = f"{segments[0].coords[-1][0]}_{segments[0].coords[-1][1]}"
-        G_temp.add_edge(seg1_end, depot_node_id, weight=0)
-    if len(segments) > 1:
-        seg2_start = f"{segments[1].coords[0][0]}_{segments[1].coords[0][1]}"
-        G_temp.add_edge(depot_node_id, seg2_start, weight=0)
-
-    return G_temp, depot_node_id
-
-# Save graph
-nx.write_graphml(G, "data/processed/road_network.graphml")
-roads.to_file("data/processed/roads_utm.geojson", driver="GeoJSON")
-print("Graph saved with", len(G.nodes), "nodes and", len(G.edges), "edges.")
+    # Verify taxi integration
+    taxi_nodes = [n for n, attr in final_graph.nodes(data=True) if attr.get('is_taxi_rank', False)]
+    print(f"Successfully integrated {len(taxi_nodes)} taxi ranks into road network")

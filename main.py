@@ -1,143 +1,213 @@
-# main.py
-import sys
-import os
-from pathlib import Path
-
-sys.path.append(str(Path(__file__).parent / "src"))
-
+import geopandas as gpd
 import networkx as nx
-from flask import Flask, request, jsonify, send_from_directory, g
-from pyproj import Transformer
-from pyproj.exceptions import CRSError
-from graph_manager import DynamicGraphManager
-from visualization import visualize_graph
-from vrp_solver import solve_vrp
+import osmnx as ox
+import folium
+from shapely.geometry import LineString, Point
+import random
+import numpy as np
+import requests
+from ortools.constraint_solver import routing_enums_pb2
+from ortools.constraint_solver import pywrapcp
+from geopy.distance import geodesic
 
-# Configure paths
-BASE_DIR = Path(__file__).parent
-BASE_GRAPH_PATH = BASE_DIR / "data/processed/road_network.graphml"
-ROADS_UTM_PATH = BASE_DIR / "data/processed/roads_utm.geojson"
+#Mapbox API access token
+access_token = "pk.eyJ1IjoibGVvbm9ycGlzY28iLCJhIjoiY205MDk3emFyMGkxZDJqc2F3Y2NzZjRjaSJ9.4m1DGg4-A5kxZLCJTmA6iQ"
 
-app = Flask(__name__,
-           static_folder=str(BASE_DIR / "web/static"),
-           template_folder=str(BASE_DIR / "web/templates"))
+start_lon, start_lat = -9.139337, 38.736946  
+end_lon, end_lat = -9.152, 38.720             
 
-def initialize_services():
-    """Initialize core components with thread-safe approach"""
-    if 'graph_manager' not in g:
-        g.graph_manager = DynamicGraphManager(BASE_GRAPH_PATH, ROADS_UTM_PATH)
-        
-    # Initialize transformer once per application
-    if not hasattr(app, 'transformer'):
-        app.transformer = Transformer.from_crs("EPSG:3763", "EPSG:4326")
+# Construct the URL for the Directions API with traffic information
+url = (
+    f"https://api.mapbox.com/directions/v5/mapbox/driving-traffic/"
+    f"{start_lon},{start_lat};{end_lon},{end_lat}"
+    f"?access_token={access_token}&geometries=geojson"
+)
+# Make the request to the Mapbox Directions API
+response = requests.get(url)
+if response.status_code == 200:
+    data = response.json()
+    travel_time_seconds = data['routes'][0]['duration']
+    travel_time_minutes = travel_time_seconds / 60
 
-def setup_application():
-    """Run initial data processing if needed"""
-    # Create required directories
-    os.makedirs(BASE_DIR / "data/processed", exist_ok=True)
-    os.makedirs(BASE_DIR / "web/static/routes", exist_ok=True)
+    print(f"Mapbox: Travel time including traffic: {travel_time_seconds} seconds (~{travel_time_minutes:.1f} minutes)")
+else:
+    print("Error querying Mapbox API:", response.text)
 
-    # Process data if missing
-    if not all([BASE_GRAPH_PATH.exists(), ROADS_UTM_PATH.exists()]):
-        print("Running initial data processing...")
-        from src.preprocess_data import RoadNetworkProcessor
-        RoadNetworkProcessor().process()
+estradas = gpd.read_file('data/processed/estradas_lisboa.geojson')
+taxi_ranks = gpd.read_file('data/processed/lisbon_taxi_ranks.geojson')
 
-# Run setup when app starts
-with app.app_context():
-    setup_application()
+G = nx.Graph()
+G.graph["crs"] = "EPSG:4326"
+node_mapping = {}
 
-# Serve main interface from root URL
-@app.route("/")
-def home():
-    return send_from_directory("web/templates", "vrp_interface.html")
+for _, row in estradas.iterrows():
+    if isinstance(row.geometry, LineString):
+        coords = list(row.geometry.coords)
+        for i in range(len(coords) - 1):
+            u_coord, v_coord = coords[i], coords[i + 1]
+            if u_coord not in node_mapping:
+                node_mapping[u_coord] = len(node_mapping)
+                G.add_node(node_mapping[u_coord], x=u_coord[0], y=u_coord[1])
+            if v_coord not in node_mapping:
+                node_mapping[v_coord] = len(node_mapping)
+                G.add_node(node_mapping[v_coord], x=v_coord[0], y=v_coord[1])
+            u, v = node_mapping[u_coord], node_mapping[v_coord]
+            distance = ox.distance.great_circle(u_coord[1], u_coord[0],
+                                                v_coord[1], v_coord[0])
+            G.add_edge(u, v, weight=distance)
 
-# Optional: Explicit route for /web/vrp_interface.html
-@app.route("/web/vrp_interface.html")
-def serve_vrp_interface():
-    return send_from_directory("web/templates", "vrp_interface.html")
+if not nx.is_connected(G):
+    largest_cc = max(nx.connected_components(G), key=len)
+    G = G.subgraph(largest_cc).copy()
 
-@app.route('/set_depot', methods=['GET'])
-def handle_depot():
-    """Handle depot placement and return optimized routes"""
-    try:
-        initialize_services()
-        
-        # Validate coordinates
-        lat = request.args.get('lat', type=float)
-        lon = request.args.get('lng', type=float)
-        if None in (lat, lon):
-            return jsonify({"status": "error", "message": "Missing coordinates"}), 400
+num_clients = 4
+client_points = []
+for _ in range(num_clients):
+    random_row = estradas.sample(1).iloc[0]
+    if isinstance(random_row.geometry, LineString):
+        mid_coord = random_row.geometry.interpolate(0.5, normalized=True).coords[0]
+        client_points.append(Point(mid_coord))
 
-        # Add depot to graph
-        G_temp, depot_id = g.graph_manager.add_depot(lat, lon)
-        
-        # Solve VRP and transform coordinates
-        routes = solve_vrp(G_temp, depot_id)
-        transformed_routes = transform_route_coordinates(G_temp, routes)
+depots = [Point(row.geometry.x, row.geometry.y) for _, row in taxi_ranks.iterrows()]
+def total_distance(depot):
+    return sum(depot.distance(client) for client in client_points)
+nearest_depot = min(depots, key=total_distance)
 
-        return jsonify({
-            "status": "success",
-            "routes": transformed_routes,
-            "depot": {"lat": lat, "lon": lon}
-        })
+stops = [nearest_depot] + client_points
+n_stops = len(stops)
 
-    except (ValueError, CRSError) as e:
-        return jsonify({"status": "error", "message": str(e)}), 400
-    except Exception as e:
-        app.logger.error(f"Depot error: {str(e)}")
-        return jsonify({"status": "error", "message": "Internal server error"}), 500
 
-# Improved /solve-vrp endpoint
-@app.route('/solve-vrp', methods=['POST'])
-def solve_vrp_endpoint():
-    try:
-        initialize_services()  # Initialize graph_manager
-        data = request.get_json()
-        depot = data['depot']
-        
-        transformer = Transformer.from_crs("EPSG:4326", "EPSG:3763")
-        x, y = transformer.transform(depot['lng'], depot['lat'])
-        
-        G_temp, depot_id = g.graph_manager.add_depot(x, y)
-        
-        routes = solve_vrp(G_temp, depot_id)
-        return jsonify({
-            "status": "success",
-            "routes": transform_route_coordinates(G_temp, routes)
-        })
+def compute_distance(p1, p2):
+    # Calculate the distance in meters
+    distance_meters = geodesic((p1.y, p1.x), (p2.y, p2.x)).meters
+    
+    if distance_meters < 1000:
+        return distance_meters 
+    else:
+        return distance_meters / 1000 
 
-    except Exception as e:
-        app.logger.error(f"VRP Error: {str(e)}")
-        return jsonify({"status": "error", "message": "VRP solution failed"}), 500
 
-@app.route('/visualize')
-def visualize_routes():
-    """Generate visualization image"""
-    try:
-        initialize_services()
-        img_path = visualize_graph(g.graph_manager.G)
-        return send_from_directory(BASE_DIR / "web/static/routes", img_path)
-    except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
+distance_matrix = np.zeros((n_stops, n_stops))
+for i in range(n_stops):
+    for j in range(n_stops):
+        distance_matrix[i][j] = compute_distance(stops[i], stops[j]) if i != j else 0
 
-@app.route('/static/<path:path>')
-def serve_static(path):
-    """Serve static files"""
-    return send_from_directory(app.static_folder, path)
+data = {}
+data['distance_matrix'] = distance_matrix.tolist()
+data['demands'] = [0] + [1] * (n_stops - 1) 
+data['vehicle_capacities'] = [4]
+data['num_vehicles'] = 1
+data['depot'] = 0
 
-def transform_route_coordinates(graph, routes):
-    """Transform route coordinates from UTM to WGS84"""
-    transformed = []
-    for route in routes:
-        geo_route = []
-        for node in route:
-            x = graph.nodes[node]['x']
-            y = graph.nodes[node]['y']
-            lon, lat = app.transformer.transform(x, y)
-            geo_route.append((lat, lon))
-        transformed.append(geo_route)
-    return transformed
+manager = pywrapcp.RoutingIndexManager(len(data['distance_matrix']),
+                                       data['num_vehicles'], data['depot'])
 
-if __name__ == "__main__":
-    app.run(host='0.0.0.0', port=5000, debug=True)
+routing = pywrapcp.RoutingModel(manager)
+
+# Define cost of each arc.
+def distance_callback(from_index, to_index):
+    from_node = manager.IndexToNode(from_index)
+    to_node = manager.IndexToNode(to_index)
+    # Multiply by 1000 to convert to integer values
+    return int(data['distance_matrix'][from_node][to_node] * 1000)
+
+transit_callback_index = routing.RegisterTransitCallback(distance_callback)
+routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
+
+def demand_callback(from_index):
+    from_node = manager.IndexToNode(from_index)
+    return data['demands'][from_node]
+
+demand_callback_index = routing.RegisterUnaryTransitCallback(demand_callback)
+routing.AddDimensionWithVehicleCapacity(
+    demand_callback_index,
+    0, 
+    data['vehicle_capacities'],  
+    True,  
+    'Capacity')
+
+search_parameters = pywrapcp.DefaultRoutingSearchParameters()
+search_parameters.first_solution_strategy = (
+    routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC)
+
+solution = routing.SolveWithParameters(search_parameters)
+if solution:
+    index = routing.Start(0)
+    route_order = []
+    while not routing.IsEnd(index):
+        node_index = manager.IndexToNode(index)
+        route_order.append(node_index)
+        index = solution.Value(routing.NextVar(index))
+    route_order.append(manager.IndexToNode(index))
+else:
+    raise Exception("No solution found!")
+
+print("VRP route order (indices in stops):", route_order)
+
+m = folium.Map(location=[nearest_depot.y, nearest_depot.x],
+               zoom_start=14, tiles="cartodbpositron")
+
+route_coords = []
+for i in range(len(route_order) - 1):
+    origin = stops[route_order[i]]
+    destination = stops[route_order[i+1]]
+    
+    origin_node = ox.distance.nearest_nodes(G, origin.x, origin.y)
+    destination_node = ox.distance.nearest_nodes(G, destination.x, destination.y)
+    
+    sp = nx.shortest_path(G, source=origin_node, target=destination_node, weight="weight")
+    sp_coords = [(G.nodes[node]['y'], G.nodes[node]['x']) for node in sp]
+    route_coords.extend(sp_coords)
+    
+    if i > 0 and i < len(route_order) - 1:
+        folium.Marker(
+            [origin.y, origin.x],
+            popup=f"Paragem {i}",
+            icon=folium.DivIcon(
+                icon_size=(30, 30),
+                icon_anchor=(10, 10),
+                html=f'<div style="font-size: 12pt; color: white; background-color: green; padding: 4px; border-radius: 50%; display: flex; justify-content: center">{i}</div>'
+
+        )).add_to(m)
+
+start_stop = stops[route_order[0]]
+end_stop = stops[route_order[-1]]
+midpoint = route_coords[len(route_coords)//2]
+
+if route_order[0] == route_order[-1]:
+    folium.Marker(
+        [start_stop.y, start_stop.x],
+        popup="Início/Fim: Praça de Táxis",
+        icon=folium.Icon(color="darkred", icon="play", prefix='fa')
+    ).add_to(m)
+else:
+    folium.Marker(
+        [start_stop.y, start_stop.x],
+        popup="Início: Praça de Táxis",
+        icon=folium.Icon(color="darkred", icon="play", prefix='fa')
+    ).add_to(m)
+    folium.Marker(
+        [end_stop.y, end_stop.x],
+        popup=("Fim: Praça de Táxis" if route_order[-1] == 0 
+               else f"End: Paragem {len(route_order)-1}"),
+        icon=folium.Icon(color="darkred", icon="stop", prefix='fa')
+    ).add_to(m)
+
+distance_km = compute_distance(stops[route_order[0]], stops[route_order[-1]])
+
+info_text = (
+    f"<b>Tempo Esperado de Viagem: {travel_time_minutes:.1f} min</b><br>"
+    f"<b>Distância: {distance:.2f} </b>"
+)
+
+folium.Marker(
+    location=midpoint,
+    popup=f"Tempo Esperado de Viagem: {travel_time_minutes:.1f} minutes",
+    icon=folium.Icon(color="blue", icon="clock", prefix='fa')
+).add_to(m)
+
+folium.PolyLine(route_coords, color="blue", weight=5).add_to(m)
+
+map_path = "web/templates/mapa_final.html"
+m.save(map_path)
+print("Map saved to:", map_path)
